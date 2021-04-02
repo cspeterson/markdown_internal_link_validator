@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+set -e
+set -o pipefail
+
+
+print_help() {
+  echo "
+    Usage:
+      ${0} [OPTIONS]... [FILES...]
+
+        Extracts local links from markdown files and verifies that they
+        point to a page in the local repo.
+
+        Note: This validator does *not* support the \`[[page name]]\` link
+        style recommended in the docs for Gollum/GitLab Wiki.
+
+    Options:
+      -b, --base-path
+          When using \`--relative\`, sets a specific base path to limit
+          traversal.
+          Default: the root of the current git repo
+
+      -d, --dropped-extension [md]
+          Sets this tool to assume targets have no extension specified in the
+          markdown, and to use the specified extension when looking for the
+          corresponding file.
+          Default: disabled
+
+      -r, --relative
+          Expect relative links in the markdown
+          Default: disabled
+
+    Examples
+      Validate local links in a standard markdown page:
+          ${0} /path/to/markdown/file.md
+
+      Validate local links in a Gollum/GitLab Wiki page:
+          ${0} --relative --drop-extensions /path/to/markdown/file.md
+
+
+  "
+}
+
+if [ $# -eq 0 ] && [ -z "${SHUNIT_TESTS}" ]; then
+  print_help
+  exit 0
+fi
+
+check_dependencies() {
+  # shellcheck disable=SC2034
+  if ! declare -n test_for_nameref_support 2>/dev/null; then
+    echo 'Your BASH does not support `nameref` variables - a version >=4.4 is required.' >&2
+    exit 2
+  fi
+  pandoc_vers="$(pandoc --version | head -n 1 | cut -d ' ' -f 2)"
+  pandoc_min_vers='2.11.3'
+  older_vers="$(echo -e "${pandoc_min_vers}\n${pandoc_vers}" | sort --version-sort | head -n1)"
+  if [ "${older_vers}" != "${pandoc_min_vers}" ]; then
+    echo 'This tool requires at least pandoc 2.11.3' >&2
+    exit 2
+  fi
+  commands=(
+    'jq'
+    'pandoc'
+    'realpath'
+  )
+  for cmd in "${commands[@]}"; do
+    if ! command -v "${cmd}" >/dev/null; then
+      # shellcheck disable=SC2006
+      echo "This tools requires that \`${cmd}\` be in this script's `$PATH`." >&2
+      exit 2
+    fi
+  done
+}
+
+filter_local_targets() {
+  # Filter the given list of targets to remove non-local links
+  #
+  # $1: nameref to array of targets
+  # $2: nameref to array of sources corresponding to the targets in $1
+  #
+  # returns: both $1 and $2 modified to remove non-internal targets
+  declare -n targets_="${1}"
+  declare -n target_sources_="${2}"
+  local filtered_targets=()
+  local filtered_target_sources=()
+  for ((i=0; i<"${#targets_[@]}"; i++ )); do
+    local target="${targets_[$i]}"
+    sourcepos="${target_sources_[$i]}"
+    if ! [[ "${target}" =~ .*://.* ]]; then
+      filtered_targets+=("${target}")
+      filtered_target_sources+=("${sourcepos}")
+    fi
+  done
+  targets_=("${filtered_targets[@]}")
+  target_sources_=("${filtered_target_sources[@]}")
+}
+
+get_link_targets() {
+  # Extract the link targets from a Markdown file
+  #
+  # $1: path to Markdown file
+  # $2: nameref to array in which the link targets will be returned
+  # $3: nameref to array in which the link target sources will be returned
+  #
+  # returns: 0/1 success if links are found
+  local filepath="${1}"
+  declare -n link_targets_="${2}"
+  declare -n link_target_sources_="${3}"
+
+  link_targets_=()
+  link_target_sources_=()
+
+  # shellcheck disable=SC2034 # it lies, it's totally being used :/
+  res="$(pandoc --from gfm+sourcepos --to json "${filepath}" | jq -r '.. | objects | select(.t=="Link") | "\(.c[0][2][0][1])'$'\t''\(.c[2][0])"')"
+  if [ -z "${res}" ]; then
+    return 1
+  fi
+  # ^ Get the line positions and link targets separated by a literal tab
+  while read -r -d $'\n' line; do
+    # Split lines into position and link target on literal tab
+    target="${line##*$'\t'}"
+    pos="${line%%$'\t'*}"
+    link_targets_+=("${target}")
+    link_target_sources_+=("${pos}")
+    # echo -n "___${pos} \n__${target}"
+    if [ -z "${pos}" ] || [ -z "${target}" ]; then
+      echo "Error processing file \`${filepath}\`." >&2
+      exit 2
+    fi
+  done <<<"${res}"
+  return 0
+}
+
+parse_args() {
+  # Before running through `getopts`, translate out convenient long-versions
+  # within $@ because we're using bash built-in getopts which does not support
+  # long args
+
+  for opt in "$@"; do
+    shift
+    case "${opt}" in
+      '--base-path')         set -- "$@" '-b' ;;
+      '--dropped-extension') set -- "$@" '-d' ;;
+      '--relative')          set -- "$@" '-r' ;;
+      '--help')              set -- "$@" '-h' ;;
+      *)                     set -- "$@" "${opt}" ;;
+    esac
+  done
+
+  # Back to the beginning now and get our opts
+  OPTIND=1
+  while getopts ':hb:d:r' opt; do
+    case "${opt}" in
+      h)
+        print_help
+        exit 0
+        ;;
+      b)
+        if [ -d "${OPTARG}" ]; then
+          readonly BASE_PATH="${OPTARG}"
+        else
+          echo '`--base-path` must be a valid directory.' >&2
+          exit 2
+        fi
+        ;;
+      d)
+        if [ -z "${OPTARG}" ]; then
+          echo 'The argument `--dropped-extension` cannot have an empty value' \
+            >&2
+          exit 2
+        fi
+        readonly DROPPED_EXTENSION="${OPTARG}"
+        ;;
+      r)
+        readonly RELATIVE_LINKS=true
+        ;;
+      *)
+        echo "Invalid option ${OPTARG}" >&2
+        print_help
+        return 255
+        ;;
+    esac
+  done
+
+  if [ -z "${BASE_PATH}" ]; then
+    if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+      echo 'This tool does not appear to be running in a git repo, and so ' \
+          'cannot automatically determine its `--base-path`. Please pass  ' \
+          'the value.' >&2
+      exit 2
+    fi
+    readonly BASE_PATH="$(git rev-parse --show-toplevel)"
+  fi
+
+  shift $(( OPTIND - 1 ))
+  if [ "${#}" -eq 0 ]; then
+    echo 'At least one file argument must be provided' >&2
+    exit 2
+  fi
+  readonly MD_FILEPATHS=( "${@}" )
+}
+
+report_error() {
+  # Print out a discovered error
+  #
+  # $1: String filepath where error was discovered
+  # $2: String line no
+  # $3: String bad link target
+  # $4: String description (opt)
+  #
+  echo "${1}${2} ('${3}') ${4}"
+
+  if [ -z "${ERROR_FOUND}" ]; then
+    readonly ERROR_FOUND=true
+  fi
+}
+
+validate_anchor() {
+  # Confirm that the given anchor exists on the given page
+  #
+  # $1: String path to file
+  # $2: String anchor name
+  #
+  # returns 0/1
+  local filepath="${1}"
+  local anchor_name="${2}"
+  # Get all the anchors in the file
+  while read -r anchor; do
+    if [ "${anchor_name}" == "${anchor}" ]; then
+      return 0
+    fi
+  done < <(pandoc --from gfm --to json "${filepath}" | jq -r '.. | objects | select(.t=="Header") | select(.c[1][0]!="") |  "\(.c[1][0])"')
+
+  # If we reach this point, we did not find a matching anchor in the file
+  return 1
+}
+
+validate_local_link() {
+  # Validate that link target points to an actual local page (and optionally, a
+  # heading)
+  #
+  # $1: String containing a link target to test
+  # $2: String containing source position of the link for reporting
+  # $3: source page file path
+  #
+  # returns: 0/1
+  local target="${1}"
+  local sourcepos="${2}"
+  local src_filepath="${3}"
+  local target_anchor
+
+  # Determine target page filename
+  if [[ "${target}" == '#'* ]]; then
+    # If this is only an anchor, then the page is the same one it came from
+    target_page="${src_filepath##*/}"
+    if [ -z "${DROPPED_EXTENSION}" ]; then
+      target_page="${target_page%%.*}"
+    fi
+  else
+    target_page="${target%%\#*}"
+    if [ -n "${DROPPED_EXTENSION}" ]; then
+      target_page="${target_page}.${DROPPED_EXTENSION}"
+    fi
+  fi
+
+  # Extract anchor if present
+  if [[ "${target}" == *'#'* ]]; then
+    target_anchor="${target##*\#}"
+  fi
+
+  # Fail if a relative link is present and unexpected
+  if [[ "${target_page}" == *'/'* ]] && [ -z "${RELATIVE_LINKS}" ]; then
+      local err='`--relative-links` was not specified, but target contains a relative path'
+      report_error "${src_filepath}" "${sourcepos}" "${target}" "${err}"
+      return 1
+  fi
+
+  # Determine target page full path
+  src_filepath_full="$(realpath "${src_filepath}")"
+  src_dir="${src_filepath_full%/*}"
+  local target_filepath
+  target_filepath="${src_dir}"/"${target_page}"
+  if ! [ -f "${target_filepath}" ]; then
+    local err="Target file \`${target_page}\` not found"
+    report_error "${src_filepath}" "${sourcepos}" "${target}" "${err}"
+    return 1
+  fi
+
+  if [ -n "${target_anchor}" ]; then
+    if ! validate_anchor "${target_filepath}" "${target_anchor}"; then
+       local err="Anchor '${target_anchor}' not found in target file"
+       report_error "${src_filepath}" "${sourcepos}" "${target}" "${err}"
+    fi
+  fi
+}
+
+main() {
+  # parse_args "#@"
+  parse_args "$@" || \
+    if [[ $? -eq 255 ]]; then
+      # Printing help returns 255 as a signal to exit here with success
+      exit 0
+    else
+      exit 2
+    fi
+
+    check_dependencies
+
+    for filepath in "${MD_FILEPATHS[@]}"; do
+      local page_targets=()
+      local page_target_sources=()
+      if ! get_link_targets "${filepath}" page_targets page_target_sources; then
+        continue
+      fi
+      filter_local_targets page_targets page_target_sources
+      for (( i=0; i<"${#page_targets[@]}"; i++)); do
+        target="${page_targets[$i]}"
+        sourcepos="${page_target_sources[$i]}"
+        validate_local_link "${target}" "${sourcepos}" "${filepath}" || continue
+      done
+    done
+
+    # echo "${targets_all[@]}"
+    if [ -n "${ERROR_FOUND}" ]; then
+      exit 1
+    fi
+}
+
+if [ -z "${SHUNIT_TESTS}" ]; then
+  main "$@"
+fi

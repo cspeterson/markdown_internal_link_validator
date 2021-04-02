@@ -1,0 +1,2 @@
+# Do not complain about backticks in single-quoted strings
+disable=SC2016

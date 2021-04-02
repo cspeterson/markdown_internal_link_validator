@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+set -e
+set -o pipefail
+
+
+# PROGDIR that the main script and functions expect is the root of the source
+# tree. One up relative to the test dir..
+progdir="$( cd "$( dirname "$( readlink -f "${BASH_SOURCE[0]}" )" )" && pwd )"
+readonly PROGDIR="${progdir%/*}"
+unset progdir
+export SHUNIT_TESTS=true
+# shellcheck disable=SC1090
+source "${PROGDIR}/md_validate_internal_links"
+
+
+check_dependencies
+
+test_filter_local_targets() {
+  local targets=(
+    'localtarget1'
+    'localtarget2#withanchor'
+    '#justananchor'
+    'https://domain.tld/page'
+    'ftp://whatev'
+  )
+  local targets_sourcepos=(
+    '@0-etc'
+    '@1-etc'
+    '@2-etc'
+    '@3-etc'
+    '@4-etc'
+  )
+  local targets_expected=(
+    'localtarget1'
+    'localtarget2#withanchor'
+    '#justananchor'
+  )
+  local targets_sourcepos_expected=(
+    '@0-etc'
+    '@1-etc'
+    '@2-etc'
+  )
+
+  filter_local_targets targets targets_sourcepos
+
+  assertEquals "${targets_expected[*]}" "${targets[*]}"
+  assertEquals "${targets_sourcepos_expected[*]}" "${targets_sourcepos[*]}"
+}
+
+test_get_link_targets() {
+  local testmd_filepath
+  testmd_filepath="$(mktemp)"
+  echo 'this is a test markdown with not just [one link], but [two](inline-internal-link)!
+[one link]: https://domain.tld/page' > "${testmd_filepath}"
+  local targets_expected=(
+    'inline-internal-link'
+    'https://domain.tld/page'
+  )
+  local sources_expected=(
+    '@1:55-1:82'
+    '@2:13-2:36'
+  )
+
+  local targets=()
+  local targets_sourcepos=()
+
+  get_link_targets "${testmd_filepath}" targets targets_sourcepos
+
+  assertEquals "${targets_expected[*]}" "${targets[*]}"
+  assertEquals "${sources_expected[*]}" "${targets_sourcepos[*]}"
+
+  rm "${testmd_filepath}"
+}
+
+test_report_error() {
+  local output_exp
+  unset ERROR_FOUND
+  output_exp="$(report_error '/path/to/file.ext' '@1-9:etc' 'an-invalid-target' 'descr')"
+  # And one more time with (non-subshell) feeling so we actually get the
+  # benefit of its side effects
+  report_error '/path/to/file.ext' '@1-9:etc' 'an-invalid-target' 'descr' >/dev/null 2>&1
+
+  assertEquals 'Error report output should include all fields' "${output_exp}" "/path/to/file.ext@1-9:etc ('an-invalid-target') descr"
+  assertEquals 'Expect ERROR_FOUND set' true "${ERROR_FOUND}"
+}
+
+test_validate_anchor() {
+  local testmd_filepath
+  testmd_filepath="$(mktemp)"
+  echo '# Some Heading' > "${testmd_filepath}"
+
+  validate_anchor "${testmd_filepath}" 'not-some-heading' || notfound=true
+  assertEquals 'Expect anchor not found in test file' true "${notfound}"
+  validate_anchor "${testmd_filepath}" 'some-heading' && found=true
+  assertEquals 'Expect anchor found in test file' true "${found}"
+
+  rm "${testmd_filepath}"
+}
+
+test_validate_local_link() {
+  local dirpath
+  local subdirpath
+  dirpath="$(mktemp --directory)"
+  subdirpath="${dirpath}/subdir"
+  mkdir "${subdirpath}"
+  touch "${dirpath}/basefile"
+  touch "${dirpath}/basefile.md"
+  touch "${subdirpath}/subfile"
+  touch "${subdirpath}/subfile.md"
+
+  # From base to subdir
+  unset DROPPED_EXTENSION
+  export RELATIVE_LINKS=true
+  local success
+  validate_local_link 'subdir/subfile.md' '@1-0:etc' "${dirpath}/basefile.md" && success=true
+  assertEquals true "${success}"
+
+  # From base to subdir, no ext
+  export DROPPED_EXTENSION='md'
+  local success
+  validate_local_link 'subdir/subfile' '@1-0:etc' "${dirpath}/basefile.md" && success=true
+  assertEquals true "${success}"
+
+  # Subdir to base
+  unset DROPPED_EXTENSION
+  export RELATIVE_LINKS=true
+  local success
+  validate_local_link '../basefile.md' '@1-0:etc' "${subdirpath}/subfile.md" && success=true
+  assertEquals true "${success}"
+
+  # Subdir to base, no ext
+  unset DROPPED_EXTENSION
+  export RELATIVE_LINKS=true
+  local success
+  validate_local_link '../basefile' '@1-0:etc' "${subdirpath}/subfile.md" && success=true
+  assertEquals true "${success}"
+
+  rm -rf "${dirpath}"
+}
+
+test_parse_args() {
+  # This needs to come at the end because the function it tests, as a side
+  # effect, leaves global readonly variables that could then clash with the
+  # other tests
+  local base_path_exp
+  base_path_exp="$(git rev-parse --show-toplevel)"
+  local dropped_extension_exp='md'
+  local md_filepaths_exp=('filename1.md' 'filename2.md')
+  local relative_links_exp=true
+
+  set -- '--relative' '--dropped-extension md' 'filename1.md' 'filename2.md'
+
+  # shellcheck disable=SC2068
+  parse_args ${@}
+  assertEquals 'Expect BASE_PATH set' "${base_path_exp}" "${BASE_PATH}"
+  assertEquals 'Expect DROPPED_EXTENSION set' "${dropped_extension_exp}" "${DROPPED_EXTENSION}"
+  assertEquals 'Expect MD_FILEPATHS set' "${md_filepaths_exp[*]}" "${MD_FILEPATHS[*]}"
+  assertEquals 'Expect RELATIVE_LINKS set' "${relative_links_exp}" "${RELATIVE_LINKS}"
+}
+
+# shellcheck disable=SC1090
+# shellcheck disable=SC1091
+if [ -s "${SHUNIT2_PATH}" ]; then
+  source "${SHUNIT2_PATH}"
+elif [ -s "$(type -p shunit2)" ]; then
+  # On $PATH
+  source "$(type -p shunit2)"
+elif [ -s '/usr/share/shunit2/shunit2' ]; then
+  # EL puts it here
+  source '/usr/share/shunit2/shunit2'
+elif [ -s ./shunit2 ]; then
+  source ./shunit2
+else
+  # shellcheck disable=SC2016
+  echo 'Testing failed - could not find `shunit2`.'
+  exit 1
+fi
