@@ -24,6 +24,7 @@ test_filter_local_targets() {
     'ftp://whatev'
     'mailto:whomever@wherever.tld'
     'callto:5555555555'
+    'tel:5555555555'
   )
   local targets_sourcepos=(
     '@0-etc'
@@ -33,6 +34,7 @@ test_filter_local_targets() {
     '@4-etc'
     '@5-etc'
     '@6-etc'
+    '@7-etc'
   )
   local targets_expected=(
     'localtarget1'
