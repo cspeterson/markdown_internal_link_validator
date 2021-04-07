@@ -87,7 +87,7 @@ filter_local_targets() {
   for ((i=0; i<"${#targets_[@]}"; i++ )); do
     local target="${targets_[$i]}"
     sourcepos="${target_sources_[$i]}"
-    if ! [[ "${target}" =~ .*://.* ]]; then
+    if ! [[ "${target}" =~ (callto|mailto):.* ]] && ! [[ "${target}" =~ .*://.* ]]; then
       filtered_targets+=("${target}")
       filtered_target_sources+=("${sourcepos}")
     fi

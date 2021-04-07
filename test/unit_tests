@@ -22,6 +22,8 @@ test_filter_local_targets() {
     '#justananchor'
     'https://domain.tld/page'
     'ftp://whatev'
+    'mailto:whomever@wherever.tld'
+    'callto:5555555555'
   )
   local targets_sourcepos=(
     '@0-etc'
@@ -29,6 +31,8 @@ test_filter_local_targets() {
     '@2-etc'
     '@3-etc'
     '@4-etc'
+    '@5-etc'
+    '@6-etc'
   )
   local targets_expected=(
     'localtarget1'
